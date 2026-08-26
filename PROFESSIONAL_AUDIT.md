@@ -13,7 +13,7 @@ named boundary) · **MISSING FOR PRODUCTION** (a real gap with a concrete reason
 | Architecture | PROFESSIONAL | One binary, three verbs, one data format. `capture`, `replay` and `analyze` all reduce to "run a shell line under the conditions this capsule describes". There are no layers because there is nothing for a layer to separate. |
 | CLI | ENOUGH FOR AN MVP | Three subcommands, a usage message on anything else, and meaningful exit codes (`replay` exits `1` when the failure does not come back, which is what makes a capsule usable in CI). `--help` and `--version` fall through to the usage text and exit `1` rather than `0`. |
 | Error handling | PROFESSIONAL | Every fallible path returns `Result<_, String>` and surfaces through one printer in `main`. No `unwrap` on I/O. Capsules are hand-edited, so `parse` rejects a malformed number or an unknown field with the line number instead of silently coercing it — `seed=abc` used to become `seed=0` and quietly change the verdict. |
-| Tests | ENOUGH FOR AN MVP | Six unit tests cover the parts where a bug would be silent: capsule round-trip, comment handling, typo rejection, method detection, knockout rewriting, and the reproduction predicate. They need no JDK, so they run anywhere. The `analyze` backup/restore path is covered by CI running the demo, not by a unit test. |
+| Tests | ENOUGH FOR AN MVP | Eight unit tests cover the parts where a bug would be silent: capsule round-trip, comment handling, typo rejection, method detection, annotated declarations, knockout rewriting, and both halves of the reproduction predicate. They need no JDK, so they run anywhere. The `analyze` backup/restore path is covered by CI running the demo, not by a unit test. |
 | Reproducibility | PROFESSIONAL | It is the product, and CI proves it: every push runs the full capture → replay → edit → analyze demo on a clean machine. |
 | Artifact persistence | PROFESSIONAL | A plain file the user owns. Written atomically enough for its size, regenerated on demand, never hidden in a cache directory. |
 | Data format | ENOUGH FOR AN MVP | `key=value`, one field per line, map keys sorted so diffs stay stable. A value cannot contain a newline, which is why only the first stderr line is recorded. That is a real ceiling; it has not been hit yet. |
@@ -40,8 +40,9 @@ named boundary) · **MISSING FOR PRODUCTION** (a real gap with a concrete reason
   the analysis, the file on disk is not the file you wrote.
 - **A knockout can preserve the fault by accident.** If the stub return value also
   triggers the bug, the method is reported as `no`. The verdict is evidence, not proof.
-- **The Java scanner is a line matcher.** A declaration split across lines, or an
-  annotation on the same line, is skipped; braces inside string literals confuse it.
+- **The Java scanner is a line matcher.** A declaration split across lines is skipped, and
+  braces inside string literals confuse it. Annotations are handled, but an annotation
+  carrying arguments on the declaration line (`@SuppressWarnings("x") void f() {`) is not.
 
 ## External review
 
