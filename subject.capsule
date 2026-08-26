@@ -1,0 +1,13 @@
+# what runs
+build=javac -d build examples/Payments.java
+command=java -cp build Payments
+source=examples/Payments.java
+
+# under which conditions
+seed=0
+input=payment:100
+env.CURRENCY=BRL
+
+# what happened
+exit=0
+error=
