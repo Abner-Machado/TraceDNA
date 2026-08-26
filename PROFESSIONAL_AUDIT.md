@@ -32,7 +32,9 @@ named boundary) · **MISSING FOR PRODUCTION** (a real gap with a concrete reason
 ## Known weaknesses, stated plainly
 
 - **The oracle is thin.** A failure is "this exit code plus this stderr line". A subject
-  that returns a wrong answer and exits `0` is invisible to every part of this tool.
+  that returns a wrong answer and exits `0` is invisible to every part of this tool, and a
+  subject that fails without writing to stderr degrades the oracle to the exit code alone —
+  every failure sharing that code then looks like the same failure.
 - **`analyze` rewrites your source file.** It backs the file up, restores it after each
   run, and recovers from an interrupted run on the next start — but for the duration of
   the analysis, the file on disk is not the file you wrote.
@@ -40,6 +42,25 @@ named boundary) · **MISSING FOR PRODUCTION** (a real gap with a concrete reason
   triggers the bug, the method is reported as `no`. The verdict is evidence, not proof.
 - **The Java scanner is a line matcher.** A declaration split across lines, or an
   annotation on the same line, is skipped; braces inside string literals confuse it.
+
+## External review
+
+The Rust core was reviewed adversarially by a second model (GPT-5.5, run headless through
+the local producer fleet) before release. Eight findings came back; each was checked
+against the code rather than accepted.
+
+- **Applied:** `reproduces` matched the recorded error as a substring, so a short `error`
+  value passed against any longer message that contained it — now matched as a whole line.
+  `signature` rejected annotated declarations such as `@Deprecated public int old()`, which
+  is common enough in real Java to matter — annotations are now skipped.
+- **Already fixed** before the review landed: silent coercion of a malformed `seed`/`exit`.
+- **Already documented:** braces inside string literals confusing the scanner; a failed
+  restore leaving the source knocked out until the next run recovers it from the backup.
+- **Rejected as incorrect:** a claimed panic in `knockout` from a failed `body_end` —
+  `signature` propagates that `None` and skips the method, so the case never reaches
+  `knockout`; and a claimed parse failure on generic return types — `split_whitespace`
+  keeps `List<String>` whole, and the spaced form still resolves to a reference stub that
+  compiles.
 
 ## Verdict
 

@@ -152,7 +152,8 @@ place for each run and restores it immediately afterwards. An interrupted run le
 - **Determinism is the subject's job.** TraceDNA hands over a seed; a program that reads
   the clock, hits the network or races threads will not reproduce from one.
 - **The oracle is the exit code plus one error line.** A wrong answer that still exits `0`
-  is invisible here.
+  is invisible here. If the subject fails silently, `error` is empty and the exit code is
+  all that is left, so any failure with the same code counts as the same failure.
 - **`analyze` understands Java only**, and only methods whose declaration ends with `{` on
   the same line. Braces inside string literals or comments confuse the scanner.
 - **A knockout can preserve a fault by accident.** If the stub value happens to also

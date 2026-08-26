@@ -140,9 +140,11 @@ impl Capsule {
         }
     }
 
-    /// The failure is the recorded exit code plus the recorded error line.
+    /// The failure is the recorded exit code plus the recorded error line, matched whole:
+    /// a short `error` value must not pass just by appearing inside a different message.
     fn reproduces(&self, run: &Run) -> bool {
-        run.exit == self.exit && (self.error.is_empty() || run.stderr.contains(&self.error))
+        run.exit == self.exit
+            && (self.error.is_empty() || run.stderr.lines().any(|line| line.trim() == self.error))
     }
 }
 
@@ -256,6 +258,7 @@ fn signature(line: &str, offset: usize, code: &str) -> Option<Method> {
         return None;
     }
     let mut words: Vec<&str> = trimmed[..trimmed.find('(')?].split_whitespace().collect();
+    words.retain(|word| !word.starts_with('@')); // annotations sit before the modifiers
     let name = words.pop()?;
     let returns = words.pop()?;
     if name == "main" || !MODIFIERS.contains(words.first()?) {
@@ -391,11 +394,25 @@ mod tests {
     #[test]
     fn reproducing_needs_both_the_exit_code_and_the_error_line() {
         let capsule = sample();
-        let same = Run { exit: 1, stdout: String::new(), stderr: "no BRL rate for 98\n".to_string() };
+        let same = Run { exit: 1, stdout: String::new(), stderr: "warming up\nno BRL rate\n".to_string() };
         let other_error = Run { exit: 1, stdout: String::new(), stderr: "disk full\n".to_string() };
         let clean = Run { exit: 0, stdout: String::new(), stderr: String::new() };
         assert!(capsule.reproduces(&same));
         assert!(!capsule.reproduces(&other_error));
         assert!(!capsule.reproduces(&clean));
+    }
+
+    #[test]
+    fn a_short_error_does_not_match_a_longer_message() {
+        let capsule = Capsule { error: "rate".to_string(), ..sample() };
+        let longer = Run { exit: 1, stdout: String::new(), stderr: "no BRL rate for 98\n".to_string() };
+        assert!(!capsule.reproduces(&longer));
+    }
+
+    #[test]
+    fn annotated_methods_are_found() {
+        let java = "public class Demo {\n    @Override\n    public String toString() {\n        return \"x\";\n    }\n\n    @Deprecated public int old() {\n        return 1;\n    }\n}\n";
+        let names: Vec<String> = methods(java).into_iter().map(|method| method.name).collect();
+        assert_eq!(names, ["toString", "old"]);
     }
 }
