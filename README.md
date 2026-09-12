@@ -75,7 +75,8 @@ Nothing else is stored: a field that cannot change the outcome does not belong h
 
 ## Try it
 
-Needs a Rust toolchain and a JDK on `PATH`. There are no other dependencies.
+Needs a Rust toolchain (edition 2021, built with 1.98) and a JDK on `PATH`. The crate uses
+the standard library only, so `cargo build` pulls nothing from crates.io.
 
 ```bash
 git clone https://github.com/Abner-Machado/TraceDNA
