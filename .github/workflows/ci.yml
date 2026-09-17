@@ -11,3 +11,11 @@ jobs:
       - run: cargo test
       # The demo is the proof that capture, replay and analyze still work end to end.
       - run: ./demo.sh
+
+  # The capsule is edited by hand on whatever machine the failure happened on,
+  # and half of those are Windows. clippy and the shell demo stay on Linux.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
