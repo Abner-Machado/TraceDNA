@@ -25,3 +25,11 @@ $TRACEDNA analyze failure.capsule
 
 step "6. the finished artifact"
 cat failure.capsule
+
+step "7. a bug that exits 0: Invoice prints a wrong total and never crashes"
+cat invoice.capsule
+
+step "8. the check reads the output and decides; capture, replay and analyze use its verdict"
+$TRACEDNA capture invoice.capsule invoice.failure
+$TRACEDNA replay invoice.failure || true
+$TRACEDNA analyze invoice.failure

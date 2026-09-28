@@ -1,0 +1,13 @@
+# what runs
+build=javac -d build examples/Invoice.java
+command=java -cp build Invoice
+check=sh examples/check-invoice.sh
+source=examples/Invoice.java
+
+# under which conditions
+seed=0
+input=
+
+# what happened
+exit=0
+error=

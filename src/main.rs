@@ -2,12 +2,16 @@
 //! which parts of the code it actually needs.
 //!
 //! `capture` searches for a seed that breaks the subject and writes the conditions down.
+//! A capsule may name a `check`: a second shell line that reads the subject's output and
+//! decides whether it was wrong, so a failure no longer has to be a crash.
 //! `replay` puts those conditions back. `analyze` removes one component at a time and
 //! replays under the same conditions: a component whose removal makes the failure
 //! disappear is a component the failure depends on.
 
 use std::collections::BTreeMap;
-use std::process::{Command, ExitCode};
+use std::io::Write;
+use std::process::{Command, ExitCode, Stdio};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -18,10 +22,11 @@ const MODIFIERS: [&str; 5] = ["public", "private", "protected", "static", "final
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let outcome = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["capture", capsule] => capture(capsule),
+        ["capture", capsule] => capture(capsule, OUTPUT),
+        ["capture", capsule, output] => capture(capsule, output),
         ["replay", capsule] => replay(capsule),
         ["analyze", capsule] => analyze(capsule),
-        _ => Err("usage:\n  tracedna capture <capsule>\n  tracedna replay <capsule>\n  tracedna analyze <capsule>".to_string()),
+        _ => Err("usage:\n  tracedna capture <capsule> [output]\n  tracedna replay <capsule>\n  tracedna analyze <capsule>".to_string()),
     };
     match outcome {
         Ok(code) => code,
@@ -37,6 +42,7 @@ fn main() -> ExitCode {
 struct Capsule {
     build: String,
     command: String,
+    check: String,
     source: String,
     seed: u64,
     input: String,
@@ -70,6 +76,7 @@ impl Capsule {
             match key {
                 "build" => capsule.build = value.to_string(),
                 "command" => capsule.command = value.to_string(),
+                "check" => capsule.check = value.to_string(),
                 "source" => capsule.source = value.to_string(),
                 "input" => capsule.input = value.to_string(),
                 "error" => capsule.error = value.to_string(),
@@ -91,10 +98,11 @@ impl Capsule {
 
     /// One field per line, sorted, so a capsule diffs cleanly in Git.
     fn render(&self) -> String {
-        let mut text = format!(
-            "# what runs\nbuild={}\ncommand={}\nsource={}\n",
-            self.build, self.command, self.source
-        );
+        let mut text = format!("# what runs\nbuild={}\ncommand={}\n", self.build, self.command);
+        if !self.check.is_empty() {
+            text += &format!("check={}\n", self.check);
+        }
+        text += &format!("source={}\n", self.source);
         text += &format!(
             "\n# under which conditions\nseed={}\ninput={}\n",
             self.seed, self.input
@@ -113,15 +121,39 @@ impl Capsule {
     }
 
     /// Runs one shell line under exactly the conditions this capsule describes.
-    fn shell(&self, line: &str) -> Result<Run, String> {
-        let output = Command::new("sh")
+    /// `feed` hands a previous run to the line: its stdout on stdin, its exit code as `EXIT`.
+    fn shell(&self, line: &str, feed: Option<&Run>) -> Result<Run, String> {
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(line)
             .env("SEED", self.seed.to_string())
             .env("INPUT", &self.input)
             .envs(&self.env)
-            .output()
+            .stdin(if feed.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(run) = feed {
+            command.env("EXIT", run.exit.to_string());
+        }
+        let mut child = command
+            .spawn()
             .map_err(|error| format!("could not start `sh`: {error}"))?;
+        // Written from another thread: a check that prints before it finishes reading
+        // would otherwise fill its stdout pipe while we are still blocked on its stdin.
+        let writer = match (feed, child.stdin.take()) {
+            (Some(run), Some(mut stdin)) => {
+                let text = run.stdout.clone();
+                Some(thread::spawn(move || stdin.write_all(text.as_bytes()).ok()))
+            }
+            _ => None,
+        };
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("`sh` did not finish: {error}"))?;
+        if let Some(writer) = writer {
+            writer.join().ok(); // a check that stops reading early closes the pipe, which is fine
+        }
         Ok(Run {
             exit: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -133,11 +165,22 @@ impl Capsule {
         if self.build.is_empty() {
             return Ok(());
         }
-        let run = self.shell(&self.build)?;
+        let run = self.shell(&self.build, None)?;
         match run.exit {
             0 => Ok(()),
             _ => Err(format!("build failed:\n{}{}", run.stdout, run.stderr)),
         }
+    }
+
+    /// Runs the subject, then the check on what it printed. With a check, the check's
+    /// exit code and stderr are the outcome: the subject can exit `0` and still be wrong.
+    fn observe(&self) -> Result<Run, String> {
+        let run = self.shell(&self.command, None)?;
+        if self.check.is_empty() {
+            return Ok(run);
+        }
+        let checked = self.shell(&self.check, Some(&run))?;
+        Ok(judged(run, checked))
     }
 
     /// The failure is the recorded exit code plus the recorded error line, matched whole:
@@ -148,20 +191,29 @@ impl Capsule {
     }
 }
 
+/// The subject's output stays visible, but only the check decides what happened.
+fn judged(run: Run, checked: Run) -> Run {
+    Run {
+        exit: checked.exit,
+        stdout: format!("{}{}{}", run.stdout, run.stderr, checked.stdout),
+        stderr: checked.stderr,
+    }
+}
+
 /// Runs the subject with a fresh seed until it fails, then writes that run down.
-fn capture(file: &str) -> Result<ExitCode, String> {
+fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
     let mut capsule = read(file)?;
     capsule.build()?;
     for attempt in 0..ATTEMPTS {
         capsule.seed = seed(attempt);
-        let run = capsule.shell(&capsule.command)?;
+        let run = capsule.observe()?;
         if run.exit != 0 {
             capsule.exit = run.exit;
             capsule.error = run.stderr.lines().next().unwrap_or_default().trim().to_string();
             capsule.needs.clear();
-            write(OUTPUT, &capsule.render())?;
+            write(output, &capsule.render())?;
             print!("{}{}", run.stdout, run.stderr);
-            println!("\ncaptured after {} runs -> {OUTPUT}", attempt + 1);
+            println!("\ncaptured after {} runs -> {output}", attempt + 1);
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -172,7 +224,7 @@ fn capture(file: &str) -> Result<ExitCode, String> {
 fn replay(file: &str) -> Result<ExitCode, String> {
     let capsule = read(file)?;
     capsule.build()?;
-    let run = capsule.shell(&capsule.command)?;
+    let run = capsule.observe()?;
     print!("{}{}", run.stdout, run.stderr);
     if capsule.reproduces(&run) {
         println!("REPRODUCED (exit {})", run.exit);
@@ -220,7 +272,7 @@ fn verdict(capsule: &Capsule) -> Result<String, String> {
     if capsule.build().is_err() {
         return Ok("inconclusive".to_string());
     }
-    let run = capsule.shell(&capsule.command)?;
+    let run = capsule.observe()?;
     Ok(if capsule.reproduces(&run) {
         "no"
     } else if run.exit == 0 {
@@ -348,6 +400,7 @@ mod tests {
         Capsule {
             build: "javac -d build X.java".to_string(),
             command: "java -cp build X".to_string(),
+            check: String::new(),
             source: "X.java".to_string(),
             seed: 48291,
             input: "payment:100".to_string(),
@@ -361,6 +414,23 @@ mod tests {
     #[test]
     fn capsule_survives_a_round_trip() {
         assert_eq!(Capsule::parse(&sample().render()).unwrap(), sample());
+    }
+
+    #[test]
+    fn a_check_survives_a_round_trip_and_stays_out_of_capsules_without_one() {
+        let checked = Capsule { check: "sh check.sh".to_string(), ..sample() };
+        assert_eq!(Capsule::parse(&checked.render()).unwrap(), checked);
+        assert!(!sample().render().contains("check="));
+    }
+
+    #[test]
+    fn with_a_check_a_clean_exit_can_still_be_the_failure() {
+        let capsule = Capsule { exit: 1, error: "negative invoice total".to_string(), ..sample() };
+        let subject = Run { exit: 0, stdout: "total=-20\n".to_string(), stderr: String::new() };
+        let check = Run { exit: 1, stdout: String::new(), stderr: "negative invoice total\n".to_string() };
+        let run = judged(subject, check);
+        assert!(capsule.reproduces(&run));
+        assert!(run.stdout.contains("total=-20"));
     }
 
     #[test]

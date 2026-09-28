@@ -3,3 +3,4 @@ target/
 failure.capsule
 *.tracedna-backup
 .impeccable/
+invoice.failure
