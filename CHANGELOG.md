@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `analyze` skipped two kinds of Java method without saying so, which reads as "the
+  failure does not need this" when the method was never tested at all. A method behind an
+  annotation that carries arguments was lost because the parameter list was found with the
+  first `(` in the line, and that paren was the annotation's. A method with no modifier was
+  rejected because one of `public`, `private`, `protected`, `static` or `final` was
+  required. Both are found now, and constructors and blocks that look like declarations
+  are still skipped.
+- `replay` and `analyze` refuse a capsule that records exit `0` and no error. Such a
+  capsule describes no failure, so every clean run matched it and `replay` answered
+  `REPRODUCED (exit 0)` on a program that was working. Both shipped subject capsules are
+  written that way, so this was the first thing a new reader saw.
+
 ## 0.2.0 (2026-09-28)
 
 ### Added

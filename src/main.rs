@@ -187,6 +187,12 @@ impl Capsule {
         Ok(judged(run, checked))
     }
 
+    /// A capsule that records a clean exit and no error line describes no failure, so
+    /// there is nothing for `replay` to bring back or for `analyze` to take apart.
+    fn records_a_failure(&self) -> bool {
+        self.exit != 0 || !self.error.is_empty()
+    }
+
     /// The failure is the recorded exit code plus the recorded error line, matched whole:
     /// a short `error` value must not pass just by appearing inside a different message.
     fn reproduces(&self, run: &Run) -> bool {
@@ -227,6 +233,7 @@ fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
 /// Puts the recorded conditions back and reports whether the failure returned.
 fn replay(file: &str) -> Result<ExitCode, String> {
     let capsule = read(file)?;
+    nothing_to_reproduce(&capsule, file)?;
     capsule.build()?;
     let run = capsule.observe()?;
     print!("{}{}", run.stdout, run.stderr);
@@ -245,6 +252,7 @@ fn replay(file: &str) -> Result<ExitCode, String> {
 /// Removes one component at a time and replays the frozen conditions against what is left.
 fn analyze(file: &str) -> Result<ExitCode, String> {
     let mut capsule = read(file)?;
+    nothing_to_reproduce(&capsule, file)?;
     if capsule.source.is_empty() {
         return Err("this capsule has no `source=` field, so there is nothing to take apart".to_string());
     }
@@ -269,6 +277,17 @@ fn analyze(file: &str) -> Result<ExitCode, String> {
     write(file, &capsule.render())?;
     println!("\nwritten to {file}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// A subject capsule is written by hand before anything has failed, so it is easy to hand
+/// one to `replay` and read a clean run back as the failure returning.
+fn nothing_to_reproduce(capsule: &Capsule, file: &str) -> Result<(), String> {
+    if capsule.records_a_failure() {
+        return Ok(());
+    }
+    Err(format!(
+        "{file} records exit 0 and no error, so it holds no failure yet: run `tracedna capture {file}` first"
+    ))
 }
 
 /// Does the failure survive without this component?
@@ -483,6 +502,17 @@ mod tests {
         let run = judged(subject, check);
         assert!(capsule.reproduces(&run));
         assert!(run.stdout.contains("total=-20"));
+    }
+
+    #[test]
+    fn a_capsule_that_records_no_failure_is_refused() {
+        let subject = Capsule { exit: 0, error: String::new(), ..sample() };
+        assert!(!subject.records_a_failure());
+        assert!(nothing_to_reproduce(&subject, "subject.capsule").is_err());
+        // Either half on its own is still a failure worth replaying.
+        assert!(sample().records_a_failure());
+        assert!(Capsule { exit: 0, ..sample() }.records_a_failure());
+        assert!(Capsule { error: String::new(), ..sample() }.records_a_failure());
     }
 
     #[test]
