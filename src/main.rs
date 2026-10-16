@@ -18,6 +18,10 @@ use std::{env, fs};
 const ATTEMPTS: u32 = 200;
 const OUTPUT: &str = "failure.capsule";
 const MODIFIERS: [&str; 5] = ["public", "private", "protected", "static", "final"];
+/// Words that open a block which is not a method, and so must never be knocked out.
+const KEYWORDS: [&str; 11] = [
+    "if", "else", "for", "while", "do", "switch", "catch", "try", "synchronized", "new", "return",
+];
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -303,17 +307,27 @@ fn methods(code: &str) -> Vec<Method> {
     found
 }
 
-/// A declaration looks like `<modifier..> <type> <name>(..) {` and is not `main`.
+/// A declaration looks like `<annotation..> <modifier..> <type> <name>(..) {` and is not
+/// `main`. The modifiers are optional: a package-private method is still a method.
 fn signature(line: &str, offset: usize, code: &str) -> Option<Method> {
     let trimmed = line.trim_end();
     if !trimmed.ends_with('{') {
         return None;
     }
-    let mut words: Vec<&str> = trimmed[..trimmed.find('(')?].split_whitespace().collect();
-    words.retain(|word| !word.starts_with('@')); // annotations sit before the modifiers
+    let declaration = without_annotations(trimmed);
+    let mut words: Vec<&str> = declaration[..declaration.find('(')?].split_whitespace().collect();
     let name = words.pop()?;
-    let returns = words.pop()?;
-    if name == "main" || !MODIFIERS.contains(words.first()?) {
+    let returns = words.pop()?; // a constructor has no return type, and nothing to stub
+    if name == "main" || KEYWORDS.contains(&name) || KEYWORDS.contains(&returns) {
+        return None;
+    }
+    // Whatever is left has to be modifiers or a generic parameter. Without this,
+    // `public Demo(int size) {` reads as a method named `Demo` returning `public`.
+    if MODIFIERS.contains(&returns)
+        || !words
+            .iter()
+            .all(|word| MODIFIERS.contains(word) || word.starts_with('<'))
+    {
         return None;
     }
     let brace = offset + trimmed.rfind('{')?;
@@ -322,6 +336,44 @@ fn signature(line: &str, offset: usize, code: &str) -> Option<Method> {
         body: brace..body_end(code, brace)?,
         stub: stub(returns),
     })
+}
+
+/// Annotations sit before the declaration and may carry parentheses of their own, which
+/// would otherwise be mistaken for the parameter list and hide the method entirely.
+fn without_annotations(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    while let Some(after_at) = rest.strip_prefix('@') {
+        let name_end = after_at
+            .find(|character: char| !character.is_alphanumeric() && character != '_' && character != '.')
+            .unwrap_or(after_at.len());
+        let after_name = after_at[name_end..].trim_start();
+        rest = match after_name.strip_prefix('(') {
+            Some(arguments) => match after_arguments(arguments) {
+                Some(tail) => tail.trim_start(),
+                None => return "",
+            },
+            None => after_name,
+        };
+    }
+    rest
+}
+
+/// What follows the `)` that closes an annotation's argument list.
+fn after_arguments(text: &str) -> Option<&str> {
+    let mut depth = 1;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[index + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn body_end(code: &str, brace: usize) -> Option<usize> {
@@ -477,6 +529,26 @@ mod tests {
         let capsule = Capsule { error: "rate".to_string(), ..sample() };
         let longer = Run { exit: 1, stdout: String::new(), stderr: "no BRL rate for 98\n".to_string() };
         assert!(!capsule.reproduces(&longer));
+    }
+
+    #[test]
+    fn an_annotation_with_arguments_does_not_hide_the_method() {
+        let java = "public class Demo {\n    @SuppressWarnings(\"unchecked\") public int old() {\n        return 1;\n    }\n}\n";
+        let names: Vec<String> = methods(java).into_iter().map(|method| method.name).collect();
+        assert_eq!(names, ["old"]);
+    }
+
+    #[test]
+    fn a_method_without_a_modifier_is_still_a_method() {
+        let java = "public class Demo {\n    int fee(int amount) {\n        return amount / 2;\n    }\n}\n";
+        let names: Vec<String> = methods(java).into_iter().map(|method| method.name).collect();
+        assert_eq!(names, ["fee"]);
+    }
+
+    #[test]
+    fn constructors_and_blocks_are_not_methods() {
+        let java = "public class Demo {\n    public Demo(int size) {\n        if (size > 0) {\n        } else if (size < 0) {\n        }\n        new Thread(() -> {\n        });\n    }\n}\n";
+        assert!(methods(java).is_empty());
     }
 
     #[test]
