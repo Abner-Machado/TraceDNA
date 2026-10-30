@@ -237,6 +237,12 @@ This project was developed by an independent developer with assistance from:
 
 AI assistance was used for ideation, analysis, implementation, review and experimentation.
 
+## Sponsors
+
+No sponsors yet. If this saves your team from an agent doing something expensive,
+you can [fund the next fix](https://github.com/sponsors/Abner-Machado). The code stays
+MIT either way. See [SPONSORS.md](SPONSORS.md).
+
 ## License
 
 MIT
