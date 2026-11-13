@@ -11,6 +11,11 @@
   knockout fails or panics. The user's file is read once and never written. `build`,
   `command` and `check` are rewritten to name the copy, so a capsule behaves exactly as
   before.
+- `capture` recorded the **first** line of stderr as the error to reproduce, so a warning
+  printed before the failure became the recorded error. `replay` then looked for that
+  warning, found it on every run, and `analyze` called every method `no`: a failure that was
+  still there read as `NOT REPRODUCED`. The recorded line is now the first one that names
+  the error, falling back to the last line that is not a stack frame.
 - `analyze` skipped two kinds of Java method without saying so, which reads as "the
   failure does not need this" when the method was never tested at all. A method behind an
   annotation that carries arguments was lost because the parameter list was found with the

@@ -220,7 +220,7 @@ fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
         let run = capsule.observe()?;
         if run.exit != 0 {
             capsule.exit = run.exit;
-            capsule.error = run.stderr.lines().next().unwrap_or_default().trim().to_string();
+            capsule.error = error_line(&run.stderr);
             capsule.needs.clear();
             write(output, &capsule.render())?;
             print!("{}{}", run.stdout, run.stderr);
@@ -229,6 +229,28 @@ fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
         }
     }
     Err(format!("no failure in {ATTEMPTS} runs"))
+}
+
+/// The line of stderr worth recording.
+///
+/// The first line is not it: toolchains print warnings before the failure, and a JVM prints
+/// its `Picked up JAVA_TOOL_OPTIONS` banner before anything else. Recording that line makes
+/// `replay` look for a warning that comes back on every run, so a failure that is still there
+/// reads as `NOT REPRODUCED`. Take the first line that names the error, and fall back to the
+/// last line that is not a stack frame.
+fn error_line(stderr: &str) -> String {
+    const SIGNALS: [&str; 6] = ["Exception", "Error", "error:", "error ", "cannot", "failed"];
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    if let Some(line) = lines
+        .iter()
+        .find(|line| SIGNALS.iter().any(|signal| line.contains(signal)))
+    {
+        return line.to_string();
+    }
+    if let Some(line) = lines.iter().rev().find(|line| !line.starts_with("at ")) {
+        return line.to_string();
+    }
+    lines.first().map(|line| line.to_string()).unwrap_or_default()
 }
 
 /// Puts the recorded conditions back and reports whether the failure returned.
@@ -671,5 +693,27 @@ mod tests {
         let (working, _staged) = staged(&capsule, "class Invoice {}\n").expect("a staged copy");
         assert!(!working.source.contains('\\'));
         assert!(working.build.contains(&working.source));
+    }
+
+    #[test]
+    fn a_warning_before_the_failure_is_not_recorded_as_the_error() {
+        let stderr = "Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8\n\
+            Exception in thread \"main\" java.lang.IllegalStateException: no BRL rate\n\
+            \tat Payments.rate(Payments.java:41)\n";
+        let recorded = error_line(stderr);
+        assert!(recorded.starts_with("Exception in thread"));
+        // The point of recording that line: the failure still reproduces against it.
+        let capsule = Capsule { error: recorded, ..sample() };
+        let run = Run { exit: 1, stdout: String::new(), stderr: stderr.to_string() };
+        assert!(capsule.reproduces(&run));
+    }
+
+    #[test]
+    fn a_plain_message_is_recorded_instead_of_a_stack_frame() {
+        let stderr = "warming up\nnegative invoice total\n\tat Check.main(Check.java:9)\n";
+        assert_eq!(error_line(stderr), "negative invoice total");
+        assert_eq!(error_line(""), "");
+        assert_eq!(error_line("\n\n  \n"), "");
+        assert_eq!(error_line("just one line\n"), "just one line");
     }
 }
