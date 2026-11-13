@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- `analyze` rewrote the file named by `source` in place once per method and put it back
+  afterwards, so a run that died mid-knockout left someone's source half-edited; recovery
+  depended on a `.tracedna-backup` file the next run had to find. It now does the knockouts
+  on a copy in a temporary directory, which is deleted on the way out, including when a
+  knockout fails or panics. The user's file is read once and never written. `build`,
+  `command` and `check` are rewritten to name the copy, so a capsule behaves exactly as
+  before.
 - `analyze` skipped two kinds of Java method without saying so, which reads as "the
   failure does not need this" when the method was never tested at all. A method behind an
   annotation that carries arguments was lost because the parameter list was found with the

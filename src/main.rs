@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,7 +43,7 @@ fn main() -> ExitCode {
 }
 
 /// Everything needed to reproduce one failure, and what that failure turned out to need.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 struct Capsule {
     build: String,
     command: String,
@@ -250,33 +251,68 @@ fn replay(file: &str) -> Result<ExitCode, String> {
 }
 
 /// Removes one component at a time and replays the frozen conditions against what is left.
+/// The knockouts happen on a copy: the file named by `source` is read and never written,
+/// and the capsule on disk keeps naming that file.
 fn analyze(file: &str) -> Result<ExitCode, String> {
     let mut capsule = read(file)?;
     nothing_to_reproduce(&capsule, file)?;
     if capsule.source.is_empty() {
         return Err("this capsule has no `source=` field, so there is nothing to take apart".to_string());
     }
-    let backup = format!("{}.tracedna-backup", capsule.source);
-    if let Ok(interrupted) = fs::read_to_string(&backup) {
-        write(&capsule.source, &interrupted)?;
-    }
     let original = fs::read_to_string(&capsule.source)
         .map_err(|error| format!("cannot read {}: {error}", capsule.source))?;
-    write(&backup, &original)?;
+    let (working, _copy) = staged(&capsule, &original)?;
 
     capsule.needs.clear();
     for method in methods(&original) {
-        write(&capsule.source, &knockout(&original, &method))?;
-        let verdict = verdict(&capsule);
-        write(&capsule.source, &original)?;
-        let verdict = verdict?;
+        write(&working.source, &knockout(&original, &method))?;
+        let verdict = verdict(&working)?;
         println!("{:<12} {verdict}", method.name);
         capsule.needs.insert(method.name, verdict);
     }
-    fs::remove_file(&backup).ok();
     write(file, &capsule.render())?;
     println!("\nwritten to {file}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// A throwaway directory holding the copy `analyze` mutates. Dropping it removes the copy,
+/// including when a knockout is cut short by an error or a panic.
+struct Staged {
+    dir: PathBuf,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// A copy of the capsule pointed at a copy of the source kept in a temporary directory. The
+/// copy is named in `build`, `command` and `check`, so nothing downstream can reach the file
+/// the user is working on. Keeping the file name is what lets a public Java class still
+/// compile: `javac` matches the class name to the file name, so `Invoice.java` has to stay
+/// `Invoice.java`. Paths are written with forward slashes because the shell lines run under
+/// `sh`, which reads a backslash as an escape.
+fn staged(capsule: &Capsule, original: &str) -> Result<(Capsule, Staged), String> {
+    let name = Path::new(&capsule.source)
+        .file_name()
+        .ok_or_else(|| format!("`{}` is not a file path", capsule.source))?
+        .to_string_lossy()
+        .into_owned();
+    let dir = env::temp_dir().join(format!("tracedna-{}-{}", std::process::id(), seed(0)));
+    fs::create_dir_all(&dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let copy = Staged { dir: dir.clone() };
+    let path = dir.join(name);
+    fs::write(&path, original)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    let staged = path.to_string_lossy().replace('\\', "/");
+    let mut working = capsule.clone();
+    let replaced = capsule.source.clone();
+    for line in [&mut working.build, &mut working.command, &mut working.check] {
+        *line = line.replace(&replaced, &staged);
+    }
+    working.source = staged;
+    Ok((working, copy))
 }
 
 /// A subject capsule is written by hand before anything has failed, so it is easy to hand
@@ -586,5 +622,54 @@ mod tests {
         let java = "public class Demo {\n    @Override\n    public String toString() {\n        return \"x\";\n    }\n\n    @Deprecated public int old() {\n        return 1;\n    }\n}\n";
         let names: Vec<String> = methods(java).into_iter().map(|method| method.name).collect();
         assert_eq!(names, ["toString", "old"]);
+    }
+
+    #[test]
+    fn analyze_works_on_a_copy_and_leaves_the_users_source_alone() {
+        let dir = env::temp_dir().join(format!("tracedna-test-{}-{}", std::process::id(), seed(0)));
+        fs::create_dir_all(&dir).expect("a temporary directory");
+        let user_source = dir.join("Demo.java");
+        fs::write(&user_source, JAVA).expect("the subject");
+        let user_path = user_source.to_string_lossy().into_owned();
+
+        let capsule = Capsule {
+            source: user_path.clone(),
+            build: format!("javac -d build {user_path}"),
+            command: "java -cp build Demo".to_string(),
+            ..sample()
+        };
+        let (working, staged) = staged(&capsule, JAVA).expect("a staged copy");
+
+        // The working capsule is pointed elsewhere, and so is the line that compiles it.
+        assert_eq!(capsule.source, user_path, "the capsule on disk keeps the real path");
+        assert_ne!(working.source, user_path);
+        assert!(working.build.contains(&working.source));
+        assert!(!working.build.contains(&user_path));
+        assert!(Path::new(&working.source).exists());
+
+        // A knockout lands on the copy, and the file the user is working on stays intact.
+        write(&working.source, &knockout(JAVA, &methods(JAVA)[0])).expect("a knockout");
+        assert!(fs::read_to_string(&working.source).expect("the copy").contains("return 0;"));
+        assert_eq!(fs::read_to_string(&user_path).expect("the subject"), JAVA);
+
+        // Dropping the staged copy takes its temporary directory with it.
+        let copy = working.source.clone();
+        drop(staged);
+        assert!(!Path::new(&copy).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_staged_source_path_survives_a_shell_line() {
+        // The shell lines run under `sh`, where a backslash is an escape: a Windows path has
+        // to reach it with forward slashes, or `C:\Users` arrives as `C:Users`.
+        let capsule = Capsule {
+            source: "examples/Invoice.java".to_string(),
+            build: "javac -d build examples/Invoice.java".to_string(),
+            ..sample()
+        };
+        let (working, _staged) = staged(&capsule, "class Invoice {}\n").expect("a staged copy");
+        assert!(!working.source.contains('\\'));
+        assert!(working.build.contains(&working.source));
     }
 }

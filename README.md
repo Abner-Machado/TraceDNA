@@ -194,9 +194,10 @@ when the recorded failure comes back and `1` when it does not, so a capsule doub
 regression check: run it in CI and it tells you the day the bug stops reproducing.
 
 `analyze` is the only part that knows a language. It finds Java methods by scanning for
-`<modifier> <type> <name>(…) {` and brace-matching the body, then rewrites `source` in
-place for each run and restores it immediately afterwards. An interrupted run leaves
-`<source>.tracedna-backup` behind, and the next `analyze` restores from it before starting.
+`<modifier> <type> <name>(…) {` and brace-matching the body, then knocks one out per run.
+The knockouts happen on a copy in a temporary directory that is deleted on the way out, so
+the file named by `source` is read once and never written: an interrupted run cannot leave
+your source half-edited.
 
 ## Limitations
 

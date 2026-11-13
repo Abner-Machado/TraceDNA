@@ -57,8 +57,8 @@ checked against the code before anything changed.
   line. `signature` rejected annotated declarations such as `@Deprecated public int old()`, which
   is common enough in real Java to matter. Annotations are now skipped.
 - Already fixed before the review landed: silent coercion of a malformed `seed`/`exit`.
-- Already documented: braces inside string literals confusing the scanner; a failed
-  restore leaving the source knocked out until the next run recovers it from the backup.
+- Already documented: braces inside string literals confusing the scanner; writing to the
+  source in place (closed by running `analyze` on a copy, see below).
 - Rejected as incorrect: a claimed panic in `knockout` from a failed `body_end`:
   `signature` propagates that `None` and skips the method, so the case never reaches
   `knockout`; and a claimed parse failure on generic return types, where `split_whitespace`
@@ -89,14 +89,17 @@ someone else is editing.
 but Java can be captured and replayed but not taken apart, and Java written in a shape the
 scanner does not expect loses methods without a warning.
 
-### Biggest technical risk: `analyze`
+### Former biggest technical risk: `analyze` — closed
 
-It writes to `source` in place. The backup and restore work, and an interrupted
-run is recoverable, but the failure mode is someone's source file, which is the worst
-possible thing to be holding when the process dies.
+It used to write to `source` in place and restore it afterwards, so a process that died
+mid-knockout could leave someone's source file half-edited. It now writes only to a copy in
+a temporary directory that is deleted on the way out, including when a knockout fails or
+panics. The file the user is working on is read once and never written; the `.tracedna-backup`
+file is gone with the code that needed it.
 
 ### Highest-impact next improvement
 
-Run `analyze` against a copy of the source tree in a temporary directory instead of the
-working copy. It removes the last production blocker. The `check` field that `0.1.0` asked
-for here shipped in `0.2.0`.
+`capture` records the first line of stderr as the error, so a warning printed before the
+failure becomes the recorded error and `replay` reports `NOT REPRODUCED` for a failure that
+is still there. Record the line that names the error instead. The `check` field that `0.1.0`
+asked for here shipped in `0.2.0`.
