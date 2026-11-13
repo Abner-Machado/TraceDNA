@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -128,7 +129,8 @@ impl Capsule {
     /// Runs one shell line under exactly the conditions this capsule describes.
     /// `feed` hands a previous run to the line: its stdout on stdin, its exit code as `EXIT`.
     fn shell(&self, line: &str, feed: Option<&Run>) -> Result<Run, String> {
-        let mut command = Command::new("sh");
+        let shell = shell();
+        let mut command = Command::new(shell);
         command
             .arg("-c")
             .arg(line)
@@ -143,7 +145,7 @@ impl Capsule {
         }
         let mut child = command
             .spawn()
-            .map_err(|error| format!("could not start `sh`: {error}"))?;
+            .map_err(|error| format!("could not start `{shell}`: {error}"))?;
         // Written from another thread: a check that prints before it finishes reading
         // would otherwise fill its stdout pipe while we are still blocked on its stdin.
         let writer = match (feed, child.stdin.take()) {
@@ -499,6 +501,36 @@ fn write(file: &str, text: &str) -> Result<(), String> {
     fs::write(file, text).map_err(|error| format!("cannot write {file}: {error}"))
 }
 
+/// Locations Git for Windows installs a POSIX shell, in the order worth trying.
+const WINDOWS_SHELLS: [&str; 3] = [
+    r"C:\Program Files\Git\bin\sh.exe",
+    r"C:\Program Files\Git\usr\bin\sh.exe",
+    r"C:\Program Files (x86)\Git\bin\sh.exe",
+];
+
+/// The shell every capsule line runs under.
+///
+/// `sh` is on `PATH` on Linux and macOS, and nowhere by default on Windows — where half the
+/// machines that meet a flaky failure live. Git for Windows ships one, so look for it instead
+/// of failing on the first capsule. `TRACEDNA_SHELL` wins when it is set, so the choice stays
+/// the user's, and it is what a checkout by any other route (WSL, MSYS2, Cygwin) needs.
+fn shell() -> &'static str {
+    static FOUND: OnceLock<String> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        if let Ok(custom) = env::var("TRACEDNA_SHELL") {
+            if !custom.trim().is_empty() {
+                return custom;
+            }
+        }
+        if cfg!(windows) {
+            if let Some(found) = WINDOWS_SHELLS.iter().find(|path| Path::new(path).is_file()) {
+                return found.to_string();
+            }
+        }
+        "sh".to_string()
+    })
+}
+
 /// A short, readable, unpredictable seed.
 fn seed(attempt: u32) -> u64 {
     let now = SystemTime::now()
@@ -715,5 +747,16 @@ mod tests {
         assert_eq!(error_line(""), "");
         assert_eq!(error_line("\n\n  \n"), "");
         assert_eq!(error_line("just one line\n"), "just one line");
+    }
+
+    #[test]
+    fn a_shell_is_found_without_asking_the_user_to_put_it_on_path() {
+        let found = shell();
+        assert!(!found.trim().is_empty());
+        if cfg!(windows) {
+            // Either Git Bash is installed and found by path, or the user set TRACEDNA_SHELL,
+            // or nothing was found and `sh` stays the answer to report.
+            assert!(Path::new(found).is_file() || found == "sh", "found `{found}`");
+        }
     }
 }

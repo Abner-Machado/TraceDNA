@@ -16,6 +16,10 @@
   warning, found it on every run, and `analyze` called every method `no`: a failure that was
   still there read as `NOT REPRODUCED`. The recorded line is now the first one that names
   the error, falling back to the last line that is not a stack frame.
+- On Windows, every command failed with `could not start ``sh``: program not found` unless
+  the user happened to have a POSIX shell on `PATH`. TraceDNA now looks for the shell Git for
+  Windows installs (`Program Files\Git\bin\sh.exe`, then `usr\bin`, then the 32-bit path) and
+  uses it. `TRACEDNA_SHELL` overrides the choice for WSL, MSYS2 or Cygwin.
 - `analyze` skipped two kinds of Java method without saying so, which reads as "the
   failure does not need this" when the method was never tested at all. A method behind an
   annotation that carries arguments was lost because the parameter list was found with the
