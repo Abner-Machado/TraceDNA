@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -42,7 +44,7 @@ fn main() -> ExitCode {
 }
 
 /// Everything needed to reproduce one failure, and what that failure turned out to need.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 struct Capsule {
     build: String,
     command: String,
@@ -127,7 +129,8 @@ impl Capsule {
     /// Runs one shell line under exactly the conditions this capsule describes.
     /// `feed` hands a previous run to the line: its stdout on stdin, its exit code as `EXIT`.
     fn shell(&self, line: &str, feed: Option<&Run>) -> Result<Run, String> {
-        let mut command = Command::new("sh");
+        let shell = shell();
+        let mut command = Command::new(shell);
         command
             .arg("-c")
             .arg(line)
@@ -142,7 +145,7 @@ impl Capsule {
         }
         let mut child = command
             .spawn()
-            .map_err(|error| format!("could not start `sh`: {error}"))?;
+            .map_err(|error| format!("could not start `{shell}`: {error}"))?;
         // Written from another thread: a check that prints before it finishes reading
         // would otherwise fill its stdout pipe while we are still blocked on its stdin.
         let writer = match (feed, child.stdin.take()) {
@@ -219,7 +222,7 @@ fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
         let run = capsule.observe()?;
         if run.exit != 0 {
             capsule.exit = run.exit;
-            capsule.error = run.stderr.lines().next().unwrap_or_default().trim().to_string();
+            capsule.error = error_line(&run.stderr);
             capsule.needs.clear();
             write(output, &capsule.render())?;
             print!("{}{}", run.stdout, run.stderr);
@@ -228,6 +231,28 @@ fn capture(file: &str, output: &str) -> Result<ExitCode, String> {
         }
     }
     Err(format!("no failure in {ATTEMPTS} runs"))
+}
+
+/// The line of stderr worth recording.
+///
+/// The first line is not it: toolchains print warnings before the failure, and a JVM prints
+/// its `Picked up JAVA_TOOL_OPTIONS` banner before anything else. Recording that line makes
+/// `replay` look for a warning that comes back on every run, so a failure that is still there
+/// reads as `NOT REPRODUCED`. Take the first line that names the error, and fall back to the
+/// last line that is not a stack frame.
+fn error_line(stderr: &str) -> String {
+    const SIGNALS: [&str; 6] = ["Exception", "Error", "error:", "error ", "cannot", "failed"];
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    if let Some(line) = lines
+        .iter()
+        .find(|line| SIGNALS.iter().any(|signal| line.contains(signal)))
+    {
+        return line.to_string();
+    }
+    if let Some(line) = lines.iter().rev().find(|line| !line.starts_with("at ")) {
+        return line.to_string();
+    }
+    lines.first().map(|line| line.to_string()).unwrap_or_default()
 }
 
 /// Puts the recorded conditions back and reports whether the failure returned.
@@ -250,33 +275,68 @@ fn replay(file: &str) -> Result<ExitCode, String> {
 }
 
 /// Removes one component at a time and replays the frozen conditions against what is left.
+/// The knockouts happen on a copy: the file named by `source` is read and never written,
+/// and the capsule on disk keeps naming that file.
 fn analyze(file: &str) -> Result<ExitCode, String> {
     let mut capsule = read(file)?;
     nothing_to_reproduce(&capsule, file)?;
     if capsule.source.is_empty() {
         return Err("this capsule has no `source=` field, so there is nothing to take apart".to_string());
     }
-    let backup = format!("{}.tracedna-backup", capsule.source);
-    if let Ok(interrupted) = fs::read_to_string(&backup) {
-        write(&capsule.source, &interrupted)?;
-    }
     let original = fs::read_to_string(&capsule.source)
         .map_err(|error| format!("cannot read {}: {error}", capsule.source))?;
-    write(&backup, &original)?;
+    let (working, _copy) = staged(&capsule, &original)?;
 
     capsule.needs.clear();
     for method in methods(&original) {
-        write(&capsule.source, &knockout(&original, &method))?;
-        let verdict = verdict(&capsule);
-        write(&capsule.source, &original)?;
-        let verdict = verdict?;
+        write(&working.source, &knockout(&original, &method))?;
+        let verdict = verdict(&working)?;
         println!("{:<12} {verdict}", method.name);
         capsule.needs.insert(method.name, verdict);
     }
-    fs::remove_file(&backup).ok();
     write(file, &capsule.render())?;
     println!("\nwritten to {file}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// A throwaway directory holding the copy `analyze` mutates. Dropping it removes the copy,
+/// including when a knockout is cut short by an error or a panic.
+struct Staged {
+    dir: PathBuf,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// A copy of the capsule pointed at a copy of the source kept in a temporary directory. The
+/// copy is named in `build`, `command` and `check`, so nothing downstream can reach the file
+/// the user is working on. Keeping the file name is what lets a public Java class still
+/// compile: `javac` matches the class name to the file name, so `Invoice.java` has to stay
+/// `Invoice.java`. Paths are written with forward slashes because the shell lines run under
+/// `sh`, which reads a backslash as an escape.
+fn staged(capsule: &Capsule, original: &str) -> Result<(Capsule, Staged), String> {
+    let name = Path::new(&capsule.source)
+        .file_name()
+        .ok_or_else(|| format!("`{}` is not a file path", capsule.source))?
+        .to_string_lossy()
+        .into_owned();
+    let dir = env::temp_dir().join(format!("tracedna-{}-{}", std::process::id(), seed(0)));
+    fs::create_dir_all(&dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let copy = Staged { dir: dir.clone() };
+    let path = dir.join(name);
+    fs::write(&path, original)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    let staged = path.to_string_lossy().replace('\\', "/");
+    let mut working = capsule.clone();
+    let replaced = capsule.source.clone();
+    for line in [&mut working.build, &mut working.command, &mut working.check] {
+        *line = line.replace(&replaced, &staged);
+    }
+    working.source = staged;
+    Ok((working, copy))
 }
 
 /// A subject capsule is written by hand before anything has failed, so it is easy to hand
@@ -441,6 +501,36 @@ fn write(file: &str, text: &str) -> Result<(), String> {
     fs::write(file, text).map_err(|error| format!("cannot write {file}: {error}"))
 }
 
+/// Locations Git for Windows installs a POSIX shell, in the order worth trying.
+const WINDOWS_SHELLS: [&str; 3] = [
+    r"C:\Program Files\Git\bin\sh.exe",
+    r"C:\Program Files\Git\usr\bin\sh.exe",
+    r"C:\Program Files (x86)\Git\bin\sh.exe",
+];
+
+/// The shell every capsule line runs under.
+///
+/// `sh` is on `PATH` on Linux and macOS, and nowhere by default on Windows — where half the
+/// machines that meet a flaky failure live. Git for Windows ships one, so look for it instead
+/// of failing on the first capsule. `TRACEDNA_SHELL` wins when it is set, so the choice stays
+/// the user's, and it is what a checkout by any other route (WSL, MSYS2, Cygwin) needs.
+fn shell() -> &'static str {
+    static FOUND: OnceLock<String> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        if let Ok(custom) = env::var("TRACEDNA_SHELL") {
+            if !custom.trim().is_empty() {
+                return custom;
+            }
+        }
+        if cfg!(windows) {
+            if let Some(found) = WINDOWS_SHELLS.iter().find(|path| Path::new(path).is_file()) {
+                return found.to_string();
+            }
+        }
+        "sh".to_string()
+    })
+}
+
 /// A short, readable, unpredictable seed.
 fn seed(attempt: u32) -> u64 {
     let now = SystemTime::now()
@@ -586,5 +676,87 @@ mod tests {
         let java = "public class Demo {\n    @Override\n    public String toString() {\n        return \"x\";\n    }\n\n    @Deprecated public int old() {\n        return 1;\n    }\n}\n";
         let names: Vec<String> = methods(java).into_iter().map(|method| method.name).collect();
         assert_eq!(names, ["toString", "old"]);
+    }
+
+    #[test]
+    fn analyze_works_on_a_copy_and_leaves_the_users_source_alone() {
+        let dir = env::temp_dir().join(format!("tracedna-test-{}-{}", std::process::id(), seed(0)));
+        fs::create_dir_all(&dir).expect("a temporary directory");
+        let user_source = dir.join("Demo.java");
+        fs::write(&user_source, JAVA).expect("the subject");
+        let user_path = user_source.to_string_lossy().into_owned();
+
+        let capsule = Capsule {
+            source: user_path.clone(),
+            build: format!("javac -d build {user_path}"),
+            command: "java -cp build Demo".to_string(),
+            ..sample()
+        };
+        let (working, staged) = staged(&capsule, JAVA).expect("a staged copy");
+
+        // The working capsule is pointed elsewhere, and so is the line that compiles it.
+        assert_eq!(capsule.source, user_path, "the capsule on disk keeps the real path");
+        assert_ne!(working.source, user_path);
+        assert!(working.build.contains(&working.source));
+        assert!(!working.build.contains(&user_path));
+        assert!(Path::new(&working.source).exists());
+
+        // A knockout lands on the copy, and the file the user is working on stays intact.
+        write(&working.source, &knockout(JAVA, &methods(JAVA)[0])).expect("a knockout");
+        assert!(fs::read_to_string(&working.source).expect("the copy").contains("return 0;"));
+        assert_eq!(fs::read_to_string(&user_path).expect("the subject"), JAVA);
+
+        // Dropping the staged copy takes its temporary directory with it.
+        let copy = working.source.clone();
+        drop(staged);
+        assert!(!Path::new(&copy).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_staged_source_path_survives_a_shell_line() {
+        // The shell lines run under `sh`, where a backslash is an escape: a Windows path has
+        // to reach it with forward slashes, or `C:\Users` arrives as `C:Users`.
+        let capsule = Capsule {
+            source: "examples/Invoice.java".to_string(),
+            build: "javac -d build examples/Invoice.java".to_string(),
+            ..sample()
+        };
+        let (working, _staged) = staged(&capsule, "class Invoice {}\n").expect("a staged copy");
+        assert!(!working.source.contains('\\'));
+        assert!(working.build.contains(&working.source));
+    }
+
+    #[test]
+    fn a_warning_before_the_failure_is_not_recorded_as_the_error() {
+        let stderr = "Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8\n\
+            Exception in thread \"main\" java.lang.IllegalStateException: no BRL rate\n\
+            \tat Payments.rate(Payments.java:41)\n";
+        let recorded = error_line(stderr);
+        assert!(recorded.starts_with("Exception in thread"));
+        // The point of recording that line: the failure still reproduces against it.
+        let capsule = Capsule { error: recorded, ..sample() };
+        let run = Run { exit: 1, stdout: String::new(), stderr: stderr.to_string() };
+        assert!(capsule.reproduces(&run));
+    }
+
+    #[test]
+    fn a_plain_message_is_recorded_instead_of_a_stack_frame() {
+        let stderr = "warming up\nnegative invoice total\n\tat Check.main(Check.java:9)\n";
+        assert_eq!(error_line(stderr), "negative invoice total");
+        assert_eq!(error_line(""), "");
+        assert_eq!(error_line("\n\n  \n"), "");
+        assert_eq!(error_line("just one line\n"), "just one line");
+    }
+
+    #[test]
+    fn a_shell_is_found_without_asking_the_user_to_put_it_on_path() {
+        let found = shell();
+        assert!(!found.trim().is_empty());
+        if cfg!(windows) {
+            // Either Git Bash is installed and found by path, or the user set TRACEDNA_SHELL,
+            // or nothing was found and `sh` stays the answer to report.
+            assert!(Path::new(found).is_file() || found == "sh", "found `{found}`");
+        }
     }
 }
